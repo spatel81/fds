@@ -14,6 +14,10 @@ USE GLOBAL_CONSTANTS, ONLY : IAXIS,JAXIS,KAXIS,MAX_DIM,LOW_IND,HIGH_IND
 USE MKL_PARDISO
 USE MKL_CLUSTER_SPARSE_SOLVER
 #endif /* WITH_MKL */
+#ifdef WITH_PETSC
+USE PETSC_MESH_ZONE, ONLY : PETSC_MZ_TYPE
+USE PETSC_ZONE_SOLVE, ONLY : PETSC_ZS_TYPE
+#endif
 
 IMPLICIT NONE (TYPE,EXTERNAL)
 
@@ -624,6 +628,9 @@ TYPE SPECIES_MIXTURE_TYPE
    LOGICAL :: EXPLICIT_G_F=.FALSE.        !< All subspecies have an explicitly defined G_F
    REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: WQABS,WQSCA
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: R50
+   REAL(EB) :: OXR                  !< Required oxygen for complete combustion (gm/gm-species)
+   REAL(EB) :: OXA                  !< Available oxygen for combustion (gm/gm-species)
+   
 
 END TYPE SPECIES_MIXTURE_TYPE
 
@@ -702,6 +709,7 @@ TYPE REACTION_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: THIRD_EFF       !< Third body collision efficiencies
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: THIRD_EFF_READ  !< Holding array for THIRD_EFF
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: DELTA_G         !< The DELTA_G(T) array for a reverse reaction pair
+   REAL(EB), ALLOCATABLE, DIMENSION(:) :: DELTA_S         !< The DELTA_S(T) array for a reverse reaction pair (entropy)
    INTEGER, ALLOCATABLE, DIMENSION(:) :: N_S_INDEX        !< Primitive species indices for N_S
    INTEGER, ALLOCATABLE, DIMENSION(:) :: N_S_INT          !< Array of species exponents
    INTEGER, ALLOCATABLE, DIMENSION(:) :: NU_INDEX         !< Lumped species indices for N_S
@@ -752,7 +760,7 @@ TYPE MATERIAL_TYPE
    REAL(EB) :: TMP_BOIL                                 !< Boiling temperature (K) of a liquid
    REAL(EB) :: MW=-1._EB                                !< Molecular weight (g/mol)
    REAL(EB) :: REFERENCE_ENTHALPY                       !< Reference enthalpy (J/kg)
-   REAL(EB) :: REFERENCE_ENTHALPY_TEMPERATURE           !< Temperature for the reference enthalpy (J/kg)
+   REAL(EB) :: REFERENCE_ENTHALPY_TEMPERATURE           !< Temperature for the reference enthalpy (K)
    INTEGER :: PYROLYSIS_MODEL                           !< Type of pyrolysis model (SOLID, LIQUID, VEGETATION)
    CHARACTER(LABEL_LENGTH) :: ID                        !< Identifier
    CHARACTER(LABEL_LENGTH) :: RAMP_K_S                  !< Name of RAMP for thermal conductivity of solid
@@ -944,6 +952,8 @@ TYPE SURFACE_TYPE
    LOGICAL :: EMISSIVITY_SPECIFIED=.FALSE.           !< Indicates if user has specified a surface emissivity
    LOGICAL :: EMISSIVITY_BACK_SPECIFIED=.FALSE.      !< Indicates if user has specified a back surface emissivity
    LOGICAL :: INERT_Q_REF                            !< Treat REFERENCE_HEAT_FLUX as an inert atmosphere test
+   LOGICAL :: ALLOW_UNDERSIDE_PARTICLES=.FALSE.      !< Allow droplets to move along downward facing surfaces
+   LOGICAL :: ALLOW_SURFACE_PARTICLES=.TRUE.         !< Allow particles to live on a solid surface
    INTEGER :: GEOMETRY,BACKING,PROFILE,HEAT_TRANSFER_MODEL=0,NEAR_WALL_TURB_MODEL=5
    CHARACTER(LABEL_LENGTH) :: PART_ID
    CHARACTER(LABEL_LENGTH) :: ID,TEXTURE_MAP,LEAK_PATH_ID(2)
@@ -1001,7 +1011,7 @@ TYPE OMESH_TYPE
    REAL(EB), ALLOCATABLE, DIMENSION(:,:,:) :: U_LNK, V_LNK, W_LNK
 
    ! Level Set
-   REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: PHI_LS,PHI1_LS,U_LS,V_LS,Z_LS,TOA
+   REAL(EB), ALLOCATABLE, DIMENSION(:,:) :: PHI_LS,PHI1_LS,U_LS,V_LS,Z_LS,T_ARR,T_RES
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: REAL_SEND_PKG14,REAL_RECV_PKG14
 
 END TYPE OMESH_TYPE
@@ -1451,7 +1461,7 @@ TYPE VENTS_TYPE
                X1_ORIG=0._EB,X2_ORIG=0._EB,Y1_ORIG=0._EB,Y2_ORIG=0._EB,Z1_ORIG=0._EB,Z2_ORIG=0._EB, &
                X0=-9.E6_EB,Y0=-9.E6_EB,Z0=-9.E6_EB,FIRE_SPREAD_RATE,UNDIVIDED_INPUT_AREA=0._EB,INPUT_AREA=0._EB,&
                TMP_EXTERIOR=-1000._EB,DYNAMIC_PRESSURE=0._EB,UVW(3)=-1.E12_EB,RADIUS=-1._EB
-   LOGICAL :: ACTIVATED=.TRUE.,GHOST_CELLS_ONLY=.FALSE.,GEOM=.FALSE.
+   LOGICAL :: ACTIVATED=.TRUE.,GEOM=.FALSE.
    CHARACTER(LABEL_LENGTH) :: DEVC_ID='null',CTRL_ID='null',ID='null'
    ! turbulent inflow (experimental)
    INTEGER :: N_EDDY=0
@@ -1508,6 +1518,7 @@ TYPE SLICE_TYPE
    LOGICAL :: TERRAIN_SLICE=.FALSE.,CELL_CENTERED=.FALSE.,RLE=.FALSE.,DEBUG=.FALSE.,THREE_D=.FALSE.
    CHARACTER(LABEL_LENGTH) :: SLICETYPE='STRUCTURED',SMOKEVIEW_LABEL
    CHARACTER(LABEL_LENGTH) :: SMOKEVIEW_BAR_LABEL,ID='null',MATL_ID='null'
+   CHARACTER(200) :: SLCF_NAME='null'
 END TYPE SLICE_TYPE
 
 TYPE RAD_FILE_TYPE
@@ -1562,7 +1573,6 @@ TYPE (PROFILE_TYPE), DIMENSION(:), ALLOCATABLE, TARGET :: PROFILE
 
 TYPE INITIALIZATION_TYPE
    REAL(EB) :: TEMPERATURE      !< Temperature (K) of the initialized region
-   REAL(EB) :: DENSITY          !< Density (kg/m3) of the initialized region
    REAL(EB) :: X1               !< Lower x boundary of the initialized region (m)
    REAL(EB) :: X2               !< Upper x boundary of the initialized region (m)
    REAL(EB) :: Y1               !< Lower y boundary of the initialized region (m)
@@ -1592,19 +1602,23 @@ TYPE INITIALIZATION_TYPE
    REAL(EB) :: CHI_R            !< Radiative fraction of HRRPUV
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: PARTICLE_INSERT_CLOCK  !< Time of last particle insertion (s)
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: MASS_FRACTION          !< Mass fraction of gas components
+   REAL(EB), ALLOCATABLE, DIMENSION(:) :: VOLUME_FRACTION        !< Volume fraction of gas components
    REAL(EB), ALLOCATABLE, DIMENSION(:) :: VOLUME_ADJUST          !< Multiplicative factor to account for FDS grid snap
-   INTEGER  :: PART_INDEX=0     !< Particle class index of inserted particles
-   INTEGER  :: N_PARTICLES      !< Number of particles to insert
-   INTEGER  :: DEVC_INDEX=0     !< Index of the device that uses this INITIALIZATION variable
-   INTEGER  :: CTRL_INDEX=0     !< Index of the controller that uses this INITIALIZATION variable
-   INTEGER  :: N_PARTICLES_PER_CELL=0 !< Number of particles to insert in each cell
-   INTEGER  :: ORIENTATION_RAMP_INDEX(3)=0 !< Ramp index for particle orientation
-   INTEGER  :: PATH_RAMP_INDEX(3)=0   !< Ramp index of a particle path
-   INTEGER  :: RAMP_Q_INDEX=0         !< Ramp index for HRRPUV
-   INTEGER  :: RAMP_PART_INDEX=0         !< Ramp index for MASS_PER_TIME or MASS_PER_VOLUME
-   LOGICAL :: ADJUST_DENSITY=.FALSE.
-   LOGICAL :: ADJUST_TEMPERATURE=.FALSE.
-   LOGICAL :: ADJUST_SPECIES_CONCENTRATION=.FALSE.
+   INTEGER :: PART_INDEX=0                                       !< Particle class index of inserted particles
+   INTEGER :: N_PARTICLES                                        !< Number of particles to insert
+   INTEGER :: DEVC_INDEX=0                                       !< Index of the device that uses this INITIALIZATION variable
+   INTEGER :: CTRL_INDEX=0                                       !< Index of the controller that uses this INITIALIZATION variable
+   INTEGER :: N_PARTICLES_PER_CELL=0                             !< Number of particles to insert in each cell
+   INTEGER :: ORIENTATION_RAMP_INDEX(3)=0                        !< Ramp index for particle orientation
+   INTEGER :: PATH_RAMP_INDEX(3)=0                               !< Ramp index of a particle path
+   INTEGER :: RAMP_Q_INDEX=0                                     !< Ramp index for HRRPUV
+   INTEGER :: RAMP_PART_INDEX=0                                  !< Ramp index for MASS_PER_TIME or MASS_PER_VOLUME
+   INTEGER :: RAMP_TMP_Z_INDEX=0                                 !< Ramp index for temperature vertical profile (K)
+   INTEGER, ALLOCATABLE, DIMENSION(:) :: RAMP_MF_Z_INDEX         !< Ramp index for species mass fraction vertical profile
+   INTEGER, ALLOCATABLE, DIMENSION(:) :: RAMP_VF_Z_INDEX         !< Ramp index for species volume fraction vertical profile
+   LOGICAL :: ADJUST_INITIAL_CONDITIONS=.FALSE.
+   LOGICAL :: VOLUME_FRACTIONS_SPECIFIED=.FALSE.
+   LOGICAL :: MASS_FRACTIONS_SPECIFIED=.FALSE.
    LOGICAL :: SINGLE_INSERTION=.TRUE.
    LOGICAL :: CELL_CENTERED=.FALSE.
    LOGICAL :: UNIFORM=.FALSE.
@@ -1663,6 +1677,11 @@ TYPE ZONE_MESH_TYPE
 #else
    INTEGER, ALLOCATABLE :: PT_H(:)
 #endif /* WITH_MKL */
+#ifdef WITH_PETSC
+   TYPE(PETSC_MZ_TYPE) PETSC_MZ
+#else
+   INTEGER :: PETSC_MZ
+#endif
    INTEGER :: NUNKH=0                                 !< Number of unknowns in pressure solution for a given ZONE_MESH
    INTEGER :: NCVLH=0                                 !< Number of pressure control volumes for a given ZONE_MESH
    INTEGER :: ICVL=0                                  !< Control volume counter for parent ZONE
@@ -1687,6 +1706,11 @@ TYPE ZONE_SOLVE_TYPE
 #else
    INTEGER, ALLOCATABLE :: PT_H(:)
 #endif /* WITH_MKL */
+#ifdef WITH_PETSC
+   TYPE(PETSC_ZS_TYPE) :: PETSC_ZS
+#else
+   INTEGER :: PETSC_ZS
+#endif
    INTEGER :: NUNKH_LOCAL=0                           !< SUM(NUNKH_LOC(LOWER_MESH_INDEX:UPPER_MESH_INDEX)).
    INTEGER :: NUNKH_TOTAL=0                           !< SUM(NUNKH_TOT(LOWER_MESH_INDEX:UPPER_MESH_INDEX)).
    INTEGER :: TOT_NNZ_H=0                             !< Total number of non-zeros owned by this process for a pres zone.
@@ -1703,6 +1727,8 @@ TYPE ZONE_SOLVE_TYPE
    INTEGER ,ALLOCATABLE, DIMENSION(:)   :: IA_H,JA_H  !< Matrix indexes for pressure zone, up triang part, CSR format.
    REAL(EB),ALLOCATABLE, DIMENSION(:)   :: F_H,X_H    !< RHS and Solution containers for pressure zone.
    REAL(FB),ALLOCATABLE, DIMENSION(:)   :: A_H_FB,F_H_FB,X_H_FB!< Arrays in case of single precision solve.
+   INTEGER :: NUNKH_LOCAL_RS = 0                      ! Total number of unknowns for the resource set.
+   INTEGER, ALLOCATABLE, DIMENSION(:)   :: NUNKH_LOC_RS, UNKH_IND_RS ! Arrays for Matrix gathering per resource set (GPUs).
 END TYPE ZONE_SOLVE_TYPE
 
 TYPE (ZONE_SOLVE_TYPE), DIMENSION(:), ALLOCATABLE, TARGET :: ZONE_SOLVE
